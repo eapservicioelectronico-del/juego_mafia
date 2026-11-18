@@ -39,8 +39,8 @@ ul{list-style:none;margin:0;padding:0}li{padding:6px 0;border-bottom:1px solid v
 <script>
 var app = document.getElementById('app');
 var mode = 'home', myid = '', conns = {}, code = '', err = '';
-var cfg = { n: 6, mafia: 2 }, dealt = false, assign = {}, showAll = false, G = null, st = null;
-var lobby = { names: [], n: 0 }, card = null, flipped = false, joined = false, full = false;
+var cfg = { n: 6, mafia: 2, on: { doctor: true, police: true, escort: false, detective: false, drunk: false } }, dealt = false, assign = {}, showAll = false, G = null, st = null;
+var myVote = null, lobby = { names: [], n: 0 }, card = null, flipped = false, joined = false, full = false;
 var name = '', hashCode = (location.hash || '').replace('#', '').replace(/\D/g, '').slice(0, 4);
 try { name = localStorage.getItem('mafia-name') || ''; } catch (e) {}
 
@@ -48,14 +48,17 @@ var ROLES = {
   mafia:    { e: '🔫', t: 'Mafioso',  d: 'De noche elegís con tu banda a quién eliminar. De día, disimulá.' },
   doctor:   { e: '🩺', t: 'Doctor',   d: 'Cada noche podés salvar a una persona del ataque de la mafia.' },
   police:   { e: '🕵️', t: 'Policía',  d: 'Cada noche investigás a una persona: el narrador te dice si es mafioso.' },
+  detective:{ e: '🔍', t: 'Detective', d: 'Cada noche investigás a una persona: el narrador te dice su rol exacto.' },
+  escort:   { e: '💋', t: 'Prostituta', d: 'Cada noche distraés a una persona: esa noche no puede usar su poder.' },
+  drunk:    { e: '🍺', t: 'Alcohólico', d: 'Sin poderes, del lado del pueblo. Si la policía o el detective te investigan, parecés mafioso.' },
   villager: { e: '🙂', t: 'Aldeano',  d: 'Sin poderes. Debatí de día y votá para descubrir a la mafia.' }
 };
 function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
-function deck(n, m) {
+function deck(n, m, on) {
   m = Math.max(1, Math.min(m, n - 2));
   var d = [], i;
   for (i = 0; i < m; i++) d.push('mafia');
-  if (n >= 5) { d.push('doctor'); d.push('police'); }
+  if (n >= 5) ['doctor', 'police', 'escort', 'detective', 'drunk'].forEach(function (r) { if (on[r] && d.length < n - 1) d.push(r); });
   while (d.length < n) d.push('villager');
   return d.slice(0, n);
 }
@@ -86,6 +89,10 @@ function hostOpen() {
   });
   peer.on('connection', function (c) {
     c.on('data', function (msg) {
+      if (msg && msg.t === 'vote') {
+        if (dealt && G && G.phase === 'vote' && G.alive[c.peer] && G.alive[msg.for] && msg.for !== c.peer) { G.votes[c.peer] = msg.for; render(); }
+        return;
+      }
       if (msg && msg.t === 'join') {
         links[c.peer] = c;
         conns[c.peer] = { name: String(msg.name || 'Jugador').slice(0, 20) };
@@ -105,7 +112,7 @@ function sendLobby() {
   ids().forEach(function (k) { send(k, m); });
 }
 function deal() {
-  var list = ids().slice(0, cfg.n), d = shuffle(deck(list.length, cfg.mafia));
+  var list = ids().slice(0, cfg.n), d = shuffle(deck(list.length, cfg.mafia, cfg.on));
   assign = {};
   list.forEach(function (k, i) { assign[k] = d[i]; });
   list.forEach(function (k) {
@@ -114,7 +121,7 @@ function deal() {
   });
   ids().filter(function (k) { return list.indexOf(k) < 0; }).forEach(function (k) { send(k, { t: 'full' }); });
   dealt = true; showAll = false;
-  G = { phase: 'night', round: 1, alive: {}, pick: {}, msg: '', win: '' };
+  G = { phase: 'night', round: 1, alive: {}, pick: {}, votes: {}, msg: '', win: '' };
   list.forEach(function (k) { G.alive[k] = true; });
   broadcast(); render();
 }
@@ -123,15 +130,21 @@ function newRound() { dealt = false; G = null; assign = {}; ids().forEach(functi
 /* ---------- Partida (maestro) ---------- */
 function nm(k) { return conns[k] ? conns[k].name : '?'; }
 function broadcast() {
-  Object.keys(assign).forEach(function (k) { send(k, { t: 'st', phase: G.phase, round: G.round, alive: G.alive[k], msg: G.msg, win: G.win }); });
+  Object.keys(assign).forEach(function (k) {
+    var cands = G.phase === 'vote' ? Object.keys(G.alive).filter(function (o) { return G.alive[o] && o !== k; }).map(function (o) { return { id: o, name: nm(o) }; }) : [];
+    send(k, { t: 'st', phase: G.phase, round: G.round, alive: G.alive[k], msg: G.msg, win: G.win, cands: cands });
+  });
 }
 function winCheck() {
   var al = Object.keys(G.alive).filter(function (k) { return G.alive[k]; });
   var m = al.filter(function (k) { return assign[k] === 'mafia'; }).length;
   if (!m) G.win = 'pueblo'; else if (m >= al.length - m) G.win = 'mafia';
 }
+function blockedRole() { return G.pick.block ? assign[G.pick.block] : null; }
 function dawn() {
-  var p = G.pick;
+  var p = G.pick, bl = blockedRole();
+  if (bl === 'mafia') p = { kill: null, save: p.save };
+  if (bl === 'doctor') p = { kill: p.kill, save: null };
   if (p.kill && p.kill !== p.save) { G.alive[p.kill] = false; G.msg = 'Esta noche murió ' + nm(p.kill) + '.'; }
   else G.msg = 'Esta noche no murió nadie.';
   G.phase = 'day'; winCheck(); broadcast(); render();
@@ -139,6 +152,7 @@ function dawn() {
 function out(k) {
   if (k) { G.alive[k] = false; G.msg = nm(k) + ' fue eliminado por votación.'; } else G.msg = 'Nadie fue eliminado.';
   winCheck();
+  G.votes = {};
   if (!G.win) { G.phase = 'night'; G.round++; G.pick = {}; }
   broadcast(); render();
 }
@@ -147,27 +161,40 @@ function gameView() {
   var h = '<h2>' + (G.win ? 'Fin de la partida' : PH[G.phase] + ' · Ronda ' + G.round) + '</h2><div class="panel">';
   if (G.msg) h += '<p><b>' + esc(G.msg) + '</b></p>';
   if (G.win) h += '<p class="code">🏆 Ganó ' + (G.win === 'mafia' ? 'la mafia' : 'el pueblo') + '.</p>';
+  var vc = {}, vmax = 0, vtot = 0, alv = 0;
+  Object.keys(G.votes || {}).forEach(function (v) { var t = G.votes[v]; vc[t] = (vc[t] || 0) + 1; vtot++; if (vc[t] > vmax) vmax = vc[t]; });
+  Object.keys(G.alive).forEach(function (k) { if (G.alive[k]) alv++; });
+  if (G.phase === 'vote' && !G.win) h += '<p class="muted">Votaron ' + vtot + ' de ' + alv + '. Los jugadores no ven los votos de los demás.</p>';
   h += '<ul>';
   Object.keys(assign).forEach(function (k) {
     var r = ROLES[assign[k]], a = G.alive[k], p = G.pick;
     h += '<li style="' + (a ? '' : 'opacity:.5') + '"><div class="row"><span>' + (a ? '' : '☠️ ') + r.e + ' <b>' + esc(nm(k)) + '</b></span>';
     if (a && !G.win) {
-      if (G.phase === 'night') h += '<span>' + [['kill', '🔫'], ['save', '🩺'], ['check', '🕵️']].map(function (x) {
+      if (G.phase === 'night') h += '<span>' + [['kill', '🔫', 'mafia'], ['save', '🩺', 'doctor'], ['check', '🕵️', 'police'], ['dcheck', '🔍', 'detective'], ['block', '💋', 'escort']].filter(function (x) { return Object.keys(assign).some(function (q) { return assign[q] === x[2]; }); }).map(function (x) {
         return '<button data-act="pick" data-k="' + x[0] + '" data-id="' + k + '"' + (p[x[0]] === k ? ' style="background:var(--accent);color:var(--accent-fg)"' : '') + '>' + x[1] + '</button>';
       }).join(' ') + '</span>';
-      else if (G.phase === 'vote') h += '<button data-act="out" data-id="' + k + '">Eliminar</button>';
+      else if (G.phase === 'vote') h += '<span><b' + (vc[k] && vc[k] === vmax ? ' style="color:var(--accent)"' : '') + '>' + (vc[k] || 0) + ' 🗳️</b> <button data-act="out" data-id="' + k + '">Eliminar</button></span>';
     }
     h += '</div></li>';
   });
   h += '</ul>';
   if (!G.win) {
     if (G.phase === 'night') {
-      if (G.pick.check) h += '<p class="muted">🕵️ ' + esc(nm(G.pick.check)) + (assign[G.pick.check] === 'mafia' ? ' ES mafioso.' : ' NO es mafioso.') + '</p>';
-      h += '<p class="muted">🔫 víctima · 🩺 salvado · 🕵️ investigado</p><button class="main" data-act="dawn">☀️ Amanecer</button>';
+      var bl = blockedRole();
+      if (bl) h += '<p class="muted">💋 ' + esc(nm(G.pick.block)) + ' (' + ROLES[bl].t + ') queda distraído esta noche.</p>';
+      if (G.pick.check) h += '<p class="muted">🕵️ ' + esc(nm(G.pick.check)) + (bl === 'police' ? ': la policía fue distraída, sin resultado.' : (assign[G.pick.check] === 'mafia' || assign[G.pick.check] === 'drunk') ? ' ES mafioso.' : ' NO es mafioso.') + '</p>';
+      if (G.pick.dcheck) h += '<p class="muted">🔍 ' + esc(nm(G.pick.dcheck)) + (bl === 'detective' ? ': el detective fue distraído, sin resultado.' : ' es ' + (assign[G.pick.dcheck] === 'drunk' ? 'Mafioso' : ROLES[assign[G.pick.dcheck]].t) + '.') + '</p>';
+      h += '<p class="muted">🔫 víctima · 🩺 salvado · 🕵️ investigado · 🔍 detective · 💋 distraído</p><button class="main" data-act="dawn">☀️ Amanecer</button>';
     } else if (G.phase === 'day') h += '<button class="main" data-act="tovote">🗳️ Ir a votación</button>';
     else h += '<button data-act="out" data-id="" style="width:100%;margin-top:8px">Nadie (empate)</button>';
   }
   return h + '<button data-act="newround" style="width:100%;margin-top:8px">Nueva ronda (repartir de nuevo)</button></div>';
+}
+function voteView() {
+  if (!st || st.win || !st.alive || st.phase !== 'vote' || !st.cands || !st.cands.length) return '';
+  return '<div class="panel"><p><b>🗳️ ¿A quién votás?</b></p><p class="muted">Tu voto es secreto. Podés cambiarlo hasta que el narrador cierre la votación.</p>' + st.cands.map(function (c) {
+    return '<button data-act="vote" data-id="' + esc(c.id) + '" style="width:100%;margin:4px 0;' + (myVote === c.id ? 'background:var(--accent);color:var(--accent-fg)' : '') + '">' + (myVote === c.id ? '✔ ' : '') + esc(c.name) + '</button>';
+  }).join('') + '</div>';
 }
 function banner() {
   if (!st) return '';
@@ -199,9 +226,9 @@ function join(c, n) {
     hostLink.on('data', function (m) {
       if (m.t === 'lobby') { lobby = m; card = null; st = null; full = false; }
       else if (m.t === 'card') { card = m; flipped = false; }
-      else if (m.t === 'st') { st = m; }
+      else if (m.t === 'st') { st = m; if (m.phase !== 'vote') myVote = null; }
       else if (m.t === 'full') { full = true; }
-      else if (m.t === 'reset') { card = null; st = null; full = false; flipped = false; }
+      else if (m.t === 'reset') { card = null; st = null; full = false; flipped = false; myVote = null; }
       render();
     });
     hostLink.on('close', function () { err = 'El anfitrión cerró la sala.'; mode = 'home'; closeNet(); render(); });
@@ -225,7 +252,7 @@ function render() {
     h += '<div class="panel"><p class="muted" style="text-align:center">' + (ready ? 'Código de sala' : 'Conectando…') + '</p><div class="bigcode">' + code + '</div>';
     h += '<button data-act="share" style="width:100%">Compartir enlace</button></div>';
     if (!dealt) {
-      h += '<div class="panel">' + stepper('Jugadores', 'n', 3, 20) + stepper('Mafiosos', 'mafia', 1, 6) + '<p class="muted">Con 5 o más jugadores se suman un Doctor y un Policía.</p></div>';
+      h += '<div class="panel">' + stepper('Jugadores', 'n', 3, 20) + stepper('Mafiosos', 'mafia', 1, 6) + '<p class="muted">Roles especiales (se usan con 5 o más jugadores):</p><div>' + [['doctor', '🩺 Doctor'], ['police', '🕵️ Policía'], ['detective', '🔍 Detective'], ['escort', '💋 Prostituta'], ['drunk', '🍺 Alcohólico']].map(function (x) { var on = cfg.on[x[0]]; return '<button data-act="tog" data-r="' + x[0] + '" style="margin:3px 4px 3px 0;' + (on ? 'background:var(--accent);color:var(--accent-fg)' : '') + '">' + x[1] + '</button>'; }).join('') + '</div></div>';
       var c = ids().length;
       h += '<h2>Conectados · ' + c + ' / ' + cfg.n + '</h2><div class="panel">';
       h += c ? '<ul>' + names().map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '<p class="muted">Esperando que se conecten los celulares…</p>';
@@ -241,7 +268,7 @@ function render() {
       if (lobby.names.length) h += '<ul>' + lobby.names.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>';
       h += '</div>';
     } else {
-      var r = ROLES[card.role]; h += banner();
+      var r = ROLES[card.role]; h += banner() + voteView();
       if (!flipped) h += '<div class="card back" data-act="flip"><div class="big">🂠</div><p>Tocá para ver tu carta</p></div><p class="muted" style="text-align:center">Asegurate de que nadie mire tu pantalla.</p>';
       else {
         h += '<div class="card front" data-act="flip"><div class="big">' + r.e + '</div><h3>' + r.t + '</h3><p>' + r.d + '</p>';
@@ -263,13 +290,15 @@ app.addEventListener('click', function (ev) {
     cfg[k] = act === 'inc' ? Math.min(Number(el.dataset.max), cfg[k] + 1) : Math.max(Number(el.dataset.min), cfg[k] - 1);
     sendLobby(); render();
   }
+  else if (act === 'tog') { cfg.on[el.dataset.r] = !cfg.on[el.dataset.r]; render(); }
   else if (act === 'deal') deal();
   else if (act === 'pick') { G.pick[el.dataset.k] = G.pick[el.dataset.k] === el.dataset.id ? null : el.dataset.id; render(); }
   else if (act === 'dawn') dawn();
-  else if (act === 'tovote') { G.phase = 'vote'; G.msg = ''; broadcast(); render(); }
+  else if (act === 'tovote') { G.phase = 'vote'; G.msg = ''; G.votes = {}; broadcast(); render(); }
   else if (act === 'out') out(el.dataset.id);
   else if (act === 'newround') newRound();
   else if (act === 'toggleAll') { showAll = !showAll; render(); }
+  else if (act === 'vote') { myVote = el.dataset.id; if (hostLink && hostLink.open) hostLink.send({ t: 'vote', for: myVote }); render(); }
   else if (act === 'flip') { flipped = !flipped; render(); }
   else if (act === 'share') {
     var link = location.href.split('#')[0] + '#' + code;

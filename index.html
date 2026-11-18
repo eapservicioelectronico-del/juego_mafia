@@ -68,41 +68,79 @@ function names() { return ids().map(function (k) { return conns[k].name; }); }
 
 /* ---------- Conexión por internet (PeerJS, sin servidor propio) ---------- */
 var peer = null, links = {}, hostLink = null, ready = false, PFX = 'mafia-cyd-';
+var pid = '', retryT = null, tries = 0, everJoined = false, offline = false, hiddenAt = 0;
+function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
+function lsJson(k) { try { return JSON.parse(lsGet(k)); } catch (e) { return null; } }
+function myPid() {
+  if (!pid) pid = lsGet('mafia-pid');
+  if (!pid) { pid = Math.random().toString(36).slice(2, 10) + Date.now().toString(36); lsSet('mafia-pid', pid); }
+  return pid;
+}
 function send(k, m) { var c = links[k]; if (c && c.open) { try { c.send(m); } catch (e) {} } }
-function closeNet() { try { if (peer) peer.destroy(); } catch (e) {} peer = null; links = {}; hostLink = null; ready = false; }
+function online(k) { return !!(links[k] && links[k].open); }
+function closeNet() { clearTimeout(retryT); var p = peer; peer = null; links = {}; hostLink = null; ready = false; try { if (p) p.destroy(); } catch (e) {} }
 
 /* ---------- Anfitrión ---------- */
 function startHost() {
-  mode = 'host'; err = ''; dealt = false; conns = {};
+  mode = 'host'; err = ''; dealt = false; conns = {}; G = null; assign = {};
   hostOpen();
   render();
 }
-function hostOpen() {
+function saveHost() {
+  if (mode !== 'host' || !code) return;
+  var cn = {}; Object.keys(conns).forEach(function (k) { cn[k] = { name: conns[k].name }; });
+  lsSet('mafia-host', JSON.stringify({ code: code, cfg: cfg, dealt: dealt, assign: assign, G: G, conns: cn, t: Date.now() }));
+}
+function hostOpen(fixed) {
   closeNet();
-  code = String(Math.floor(1000 + Math.random() * 9000));
-  peer = new Peer(PFX + code);
-  peer.on('open', function () { ready = true; render(); });
-  peer.on('disconnected', function () { try { peer.reconnect(); } catch (e) {} });
-  peer.on('error', function (e) {
-    if (e.type === 'unavailable-id') { hostOpen(); return; }
-    err = 'Error de conexión (' + e.type + '). Revisá tu internet y recargá.'; render();
+  code = fixed || String(Math.floor(1000 + Math.random() * 9000));
+  var me = new Peer(PFX + code);
+  peer = me;
+  me.on('open', function () { if (peer !== me) return; ready = true; tries = 0; render(); });
+  me.on('disconnected', function () { if (peer === me) { try { me.reconnect(); } catch (e) {} } });
+  me.on('error', function (e) {
+    if (peer !== me) return;
+    if (e.type === 'unavailable-id') {
+      if (fixed) { clearTimeout(retryT); retryT = setTimeout(function () { hostOpen(fixed); }, 2500); render(); }
+      else hostOpen();
+      return;
+    }
+    err = 'Error de conexión (' + e.type + '). Revisá tu internet.'; render();
   });
-  peer.on('connection', function (c) {
+  me.on('connection', function (c) {
     c.on('data', function (msg) {
-      if (msg && msg.t === 'vote') {
-        if (dealt && G && G.phase === 'vote' && G.alive[c.peer] && G.alive[msg.for] && msg.for !== c.peer) { G.votes[c.peer] = msg.for; render(); }
+      if (!msg) return;
+      if (msg.t === 'vote') {
+        var v = c._pid;
+        if (v && dealt && G && G.phase === 'vote' && G.alive[v] && G.alive[msg.for] && msg.for !== v) { G.votes[v] = msg.for; render(); }
         return;
       }
-      if (msg && msg.t === 'join') {
-        links[c.peer] = c;
-        conns[c.peer] = { name: String(msg.name || 'Jugador').slice(0, 20) };
-        if (dealt) send(c.peer, { t: 'full' }); else sendLobby();
-        render();
+      if (msg.t !== 'join') return;
+      var nmz = String(msg.name || 'Jugador').slice(0, 20), k = String(msg.pid || c.peer), cand = null;
+      /* si perdió su identificador pero hay un jugador desconectado con su mismo nombre, retoma ese lugar */
+      if (dealt && !assign[k]) {
+        cand = Object.keys(assign).filter(function (o) { return conns[o] && conns[o].name === nmz && !online(o); })[0] || null;
+        if (cand) k = cand;
       }
+      /* en la sala de espera, un nombre repetido reemplaza al anterior (evita duplicados) */
+      if (!dealt) Object.keys(conns).forEach(function (o) {
+        if (o !== k && conns[o].name === nmz) { var ol = links[o]; delete conns[o]; delete links[o]; if (ol) { try { ol.close(); } catch (e) {} } }
+      });
+      var old = links[k]; links[k] = c; c._pid = k;
+      if (old && old !== c) { try { old.close(); } catch (e) {} }
+      conns[k] = { name: nmz };
+      if (dealt) { if (assign[k]) { send(k, cardFor(k)); send(k, stFor(k)); } else send(k, { t: 'full' }); }
+      else sendLobby();
+      if (cand) send(k, { t: 'adopt', pid: k });
+      render();
     });
     c.on('close', function () {
-      delete links[c.peer];
-      if (!dealt) { delete conns[c.peer]; sendLobby(); }
+      var k = c._pid;
+      if (!k || links[k] !== c) return;
+      delete links[k];
+      if (!dealt) { delete conns[k]; sendLobby(); }
       render();
     });
   });
@@ -125,16 +163,19 @@ function deal() {
   list.forEach(function (k) { G.alive[k] = true; });
   broadcast(); render();
 }
-function newRound() { dealt = false; G = null; assign = {}; ids().forEach(function (k) { send(k, { t: 'reset' }); }); sendLobby(); render(); }
+function newRound() { Object.keys(conns).forEach(function (k) { if (!online(k)) delete conns[k]; }); dealt = false; G = null; assign = {}; ids().forEach(function (k) { send(k, { t: 'reset' }); }); sendLobby(); render(); }
 
 /* ---------- Partida (maestro) ---------- */
 function nm(k) { return conns[k] ? conns[k].name : '?'; }
-function broadcast() {
-  Object.keys(assign).forEach(function (k) {
-    var cands = G.phase === 'vote' ? Object.keys(G.alive).filter(function (o) { return G.alive[o] && o !== k; }).map(function (o) { return { id: o, name: nm(o) }; }) : [];
-    send(k, { t: 'st', phase: G.phase, round: G.round, alive: G.alive[k], msg: G.msg, win: G.win, cands: cands });
-  });
+function cardFor(k) {
+  var mates = Object.keys(assign).filter(function (o) { return o !== k && assign[o] === 'mafia'; }).map(nm);
+  return { t: 'card', role: assign[k], mates: assign[k] === 'mafia' ? mates : [] };
 }
+function stFor(k) {
+  var cands = G.phase === 'vote' ? Object.keys(G.alive).filter(function (o) { return G.alive[o] && o !== k; }).map(function (o) { return { id: o, name: nm(o) }; }) : [];
+  return { t: 'st', phase: G.phase, round: G.round, alive: G.alive[k], msg: G.msg, win: G.win, cands: cands, myvote: (G.votes && G.votes[k]) || null };
+}
+function broadcast() { Object.keys(assign).forEach(function (k) { send(k, stFor(k)); }); }
 function winCheck() {
   var al = Object.keys(G.alive).filter(function (k) { return G.alive[k]; });
   var m = al.filter(function (k) { return assign[k] === 'mafia'; }).length;
@@ -168,7 +209,7 @@ function gameView() {
   h += '<ul>';
   Object.keys(assign).forEach(function (k) {
     var r = ROLES[assign[k]], a = G.alive[k], p = G.pick;
-    h += '<li style="' + (a ? '' : 'opacity:.5') + '"><div class="row"><span>' + (a ? '' : '☠️ ') + r.e + ' <b>' + esc(nm(k)) + '</b></span>';
+    h += '<li style="' + (a ? '' : 'opacity:.5') + '"><div class="row"><span>' + (a ? '' : '☠️ ') + r.e + ' <b>' + esc(nm(k)) + '</b>' + (online(k) ? '' : ' 📴') + '</span>';
     if (a && !G.win) {
       if (G.phase === 'night') h += '<span>' + [['kill', '🔫', 'mafia'], ['save', '🩺', 'doctor'], ['check', '🕵️', 'police'], ['dcheck', '🔍', 'detective'], ['block', '💋', 'escort']].filter(function (x) { return Object.keys(assign).some(function (q) { return assign[q] === x[2]; }); }).map(function (x) {
         return '<button data-act="pick" data-k="' + x[0] + '" data-id="' + k + '"' + (p[x[0]] === k ? ' style="background:var(--accent);color:var(--accent-fg)"' : '') + '>' + x[1] + '</button>';
@@ -206,32 +247,52 @@ function banner() {
 }
 
 /* ---------- Jugador ---------- */
-function join(c, n) {
-  mode = 'player'; err = ''; joined = false; card = null; full = false; flipped = false;
-  name = n; code = c;
-  try { localStorage.setItem('mafia-name', n); } catch (e) {}
+function leave(msg) { lsDel('mafia-sess'); err = msg || ''; mode = 'home'; everJoined = false; offline = false; closeNet(); render(); }
+function scheduleRetry() {
+  if (mode !== 'player') return;
+  offline = true; render();
+  clearTimeout(retryT);
+  retryT = setTimeout(function () { join(code, name, true); }, 2500);
+}
+function join(c, n, retry) {
+  mode = 'player'; err = ''; name = n; code = c;
+  lsSet('mafia-name', n);
+  if (!retry) { joined = false; card = null; full = false; flipped = false; st = null; everJoined = false; tries = 0; myVote = null; offline = false; }
   closeNet();
-  peer = new Peer();
-  var t = setTimeout(function () {
-    if (!joined) { err = 'No pude conectar. Revisá el código y tu internet.'; mode = 'home'; closeNet(); render(); }
-  }, 15000);
-  peer.on('error', function (e) {
-    clearTimeout(t);
-    err = e.type === 'peer-unavailable' ? 'No encontré esa sala. Revisá el código.' : 'Error de conexión (' + e.type + ').';
-    mode = 'home'; closeNet(); render();
-  });
-  peer.on('open', function () {
-    hostLink = peer.connect(PFX + c, { reliable: true });
-    hostLink.on('open', function () { clearTimeout(t); hostLink.send({ t: 'join', name: n }); joined = true; render(); });
-    hostLink.on('data', function (m) {
-      if (m.t === 'lobby') { lobby = m; card = null; st = null; full = false; }
-      else if (m.t === 'card') { card = m; flipped = false; }
-      else if (m.t === 'st') { st = m; if (m.phase !== 'vote') myVote = null; }
-      else if (m.t === 'full') { full = true; }
-      else if (m.t === 'reset') { card = null; st = null; full = false; flipped = false; myVote = null; }
+  var me = new Peer(), done = false, t;
+  peer = me;
+  function fail(e) {
+    if (done || peer !== me) return;
+    done = true; clearTimeout(t);
+    if (!everJoined) return leave(e === 'peer-unavailable' ? 'No encontré esa sala. Revisá el código.' : e === 'timeout' ? 'No pude conectar. Revisá el código y tu internet.' : 'Error de conexión (' + e + ').');
+    if (tries++ > 25) return leave('Se perdió la conexión con la sala.');
+    scheduleRetry();
+  }
+  t = setTimeout(function () { fail('timeout'); }, 15000);
+  me.on('error', function (e) { fail(e.type); });
+  me.on('open', function () {
+    if (peer !== me) return;
+    var hl = peer.connect(PFX + c, { reliable: true });
+    hostLink = hl;
+    hl.on('open', function () {
+      if (peer !== me || done) return;
+      done = true; clearTimeout(t);
+      everJoined = true; tries = 0; offline = false; joined = true;
+      lsSet('mafia-sess', JSON.stringify({ code: c, name: n, t: Date.now() }));
+      hl.send({ t: 'join', name: n, pid: myPid() });
       render();
     });
-    hostLink.on('close', function () { err = 'El anfitrión cerró la sala.'; mode = 'home'; closeNet(); render(); });
+    hl.on('data', function (m) {
+      if (peer !== me) return;
+      if (m.t === 'lobby') { lobby = m; card = null; st = null; full = false; }
+      else if (m.t === 'card') { card = m; flipped = false; }
+      else if (m.t === 'st') { st = m; if (m.phase !== 'vote') myVote = null; else if (m.myvote) myVote = m.myvote; }
+      else if (m.t === 'full') { full = true; }
+      else if (m.t === 'reset') { card = null; st = null; full = false; flipped = false; myVote = null; }
+      else if (m.t === 'adopt') { pid = m.pid; lsSet('mafia-pid', pid); }
+      render();
+    });
+    hl.on('close', function () { if (peer === me && done) scheduleRetry(); });
   });
   render();
 }
@@ -243,6 +304,7 @@ function stepper(label, key, min, max) {
 function render() {
   var a = document.activeElement;
   if (a && a.tagName === 'INPUT') return;
+  if (mode === 'host') saveHost();
   var h = '<h1>🎭 Mafia</h1>';
   if (err) h += '<p class="err">' + esc(err) + '</p>';
   if (mode === 'home') {
@@ -261,6 +323,7 @@ function render() {
       h += gameView();
     }
   } else {
+    if (offline) h += '<div class="panel"><p class="muted" style="text-align:center">📡 Reconectando con la sala…</p></div>';
     if (!joined) h += '<p class="muted">Conectando…</p>';
     else if (full) h += '<div class="panel"><p>La partida ya empezó y no tenés lugar en esta ronda.</p></div>';
     else if (!card) {
@@ -277,6 +340,8 @@ function render() {
       }
     }
   }
+  if (mode === 'host') h += '<button data-act="exit" style="width:100%;margin-top:18px">Cerrar sala y salir</button>';
+  if (mode === 'player' && joined) h += '<button data-act="exit" style="width:100%;margin-top:18px">Salir de la partida</button>';
   app.innerHTML = h;
 }
 
@@ -299,6 +364,11 @@ app.addEventListener('click', function (ev) {
   else if (act === 'newround') newRound();
   else if (act === 'toggleAll') { showAll = !showAll; render(); }
   else if (act === 'vote') { myVote = el.dataset.id; if (hostLink && hostLink.open) hostLink.send({ t: 'vote', for: myVote }); render(); }
+  else if (act === 'exit') {
+    if (confirm(mode === 'host' ? '¿Cerrar la sala? Se pierde la partida en curso.' : '¿Salir de la partida? Si salís, no podrás recuperar tu carta.')) {
+      lsDel('mafia-sess'); lsDel('mafia-host'); everJoined = false; offline = false; mode = 'home'; closeNet(); render();
+    }
+  }
   else if (act === 'flip') { flipped = !flipped; render(); }
   else if (act === 'share') {
     var link = location.href.split('#')[0] + '#' + code;
@@ -313,6 +383,21 @@ app.addEventListener('click', function (ev) {
     join(c, n);
   }
 });
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+  if (mode === 'player' && everJoined && Date.now() - hiddenAt > 4000) { clearTimeout(retryT); join(code, name, true); }
+  else if (mode === 'host' && peer && peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
+});
+(function resume() {
+  var H = lsJson('mafia-host'), S = lsJson('mafia-sess'), fresh = 12 * 3600e3;
+  if (H && H.code && Date.now() - H.t < fresh && !hashCode) {
+    mode = 'host'; if (H.cfg) cfg = H.cfg; dealt = !!H.dealt; assign = H.assign || {}; G = H.G || null; conns = dealt ? (H.conns || {}) : {};
+    hostOpen(H.code);
+  } else if (S && S.code && Date.now() - S.t < fresh && (!hashCode || hashCode === S.code)) {
+    everJoined = true; joined = true; offline = true; name = S.name; code = S.code;
+    join(S.code, S.name, true);
+  }
+})();
 render();
 </script>
 </body>
